@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "rideable_sniffer_mod",
+  "version": "${version}",
+  "name": "Rideable Sniffer Mod",
+  "description": "A server-side mod that allows up to 3 players to ride sniffers simultaneously!",
+  "authors": [
+    "Karfakias"
+  ],
+  "contact": {},
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "net.rideable_sniffer.RideableSnifferMod"
+    ]
+  },
+  "mixins": [
+    "rideable_sniffer.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "minecraft": "~1.21",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}

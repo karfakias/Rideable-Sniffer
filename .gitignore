@@ -1,0 +1,22 @@
+# gradle
+.gradle/
+build/
+out/
+
+# ide
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# minecraft
+.minecraft/
+run/
+
+# misc
+*.class
+*.log
+*.swp
+*.swo
+*~
+.DS_Store

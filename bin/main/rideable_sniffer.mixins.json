@@ -1,0 +1,14 @@
+{
+  "required": true,
+  "package": "net.rideable_sniffer.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "EntityPassengerMixin",
+    "MobControlMixin",
+    "SnifferDeathMixin",
+    "ServerPlayNetworkHandlerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
