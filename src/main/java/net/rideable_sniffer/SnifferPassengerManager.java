@@ -29,6 +29,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class SnifferPassengerManager {
     private static final int MAX_PASSENGERS = 3;
+    private static final int PORTAL_DISMOUNT_DELAY_TICKS = 10;
     private static final Set<UUID> SADDLED_SNIFFERS = ConcurrentHashMap.newKeySet();
     // Ensure persisted saddles are loaded once per server lifecycle
     private static volatile boolean PERSISTED_LOADED = false;
@@ -42,6 +43,10 @@ public class SnifferPassengerManager {
     private static final Map<UUID, Vec3d> LAST_SNIFFER_POSITIONS = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> RECENT_MOUNTS = new ConcurrentHashMap<>();
     private static final Map<UUID, Integer> PROMOTION_SCHEDULE = new ConcurrentHashMap<>();
+    private static final Map<UUID, java.util.Set<UUID>> PENDING_PORTAL_RIDERS = new ConcurrentHashMap<>();
+    private static final Map<UUID, Integer> DELAYED_PORTAL_CLEANUP = new ConcurrentHashMap<>();
+    private static final Map<UUID, Integer> POST_PORTAL_PLAYER_CLEANUP = new ConcurrentHashMap<>();
+    private static final Map<UUID, Integer> POST_PORTAL_SNIFFER_CLEANUP = new ConcurrentHashMap<>();
     // Scheduled sounds for saddle removal: ticks remaining and the player who removed it
     private static final Map<UUID, Integer> SADDLE_SOUND_TICKS = new ConcurrentHashMap<>();
     private static final Map<UUID, UUID> SADDLE_SOUND_PLAYER = new ConcurrentHashMap<>();
@@ -396,7 +401,473 @@ public class SnifferPassengerManager {
         } catch (Throwable ignored) {}
     }
 
+    public static boolean handlePortalContact(Entity entity) {
+        if (entity == null) return false;
+        try {
+            World world = getReflectiveWorld(entity);
+            if (world == null || world.isClient) return false;
+        } catch (Throwable ignored) {}
+
+        net.minecraft.server.MinecraftServer server = getServerFromEntity(entity);
+
+        if (isSnifferSeatEntity(entity)) {
+            UUID snifferUuid = getSnifferUuidForSeat(entity);
+            if (snifferUuid != null) {
+                recordSeatPortalRiders(snifferUuid, entity);
+                POST_PORTAL_SNIFFER_CLEANUP.put(snifferUuid, 40);
+                schedulePortalDismount(snifferUuid);
+            }
+            return true;
+        }
+
+        if (entity instanceof SnifferEntity sniffer) {
+            recordPortalRiders(sniffer);
+            scrubPortalMomentum(sniffer);
+            if (PENDING_PORTAL_RIDERS.containsKey(sniffer.getUuid())) {
+                schedulePortalDismount(sniffer.getUuid());
+            }
+            return false;
+        }
+
+        if (entity instanceof PlayerEntity player) {
+            UUID snifferUuid = getSnifferUuidForPlayer(player);
+            if (snifferUuid != null) {
+                addPendingPortalRider(snifferUuid, player.getUuid());
+                POST_PORTAL_PLAYER_CLEANUP.put(player.getUuid(), 40);
+                schedulePortalDismount(snifferUuid);
+            }
+            scrubPortalMomentum(player);
+        }
+
+        return false;
+    }
+
+    public static void onPlayerChangeWorld(net.minecraft.server.network.ServerPlayerEntity player, net.minecraft.server.world.ServerWorld origin, net.minecraft.server.world.ServerWorld destination) {
+        if (player == null) return;
+
+        UUID snifferUuid = null;
+        try {
+            RidingInfo rinfo = RIDING_PLAYERS.remove(player.getUuid());
+            if (rinfo != null) snifferUuid = rinfo.snifferUuid;
+        } catch (Throwable ignored) {}
+
+        try {
+            Entity vehicle = player.getVehicle();
+            if (vehicle instanceof ArmorStandEntity) {
+                UUID parent = getSnifferUuidForSeat(vehicle);
+                if (parent != null) snifferUuid = parent;
+            } else if (vehicle instanceof SnifferEntity sniffer) {
+                snifferUuid = sniffer.getUuid();
+            }
+        } catch (Throwable ignored) {}
+
+        if (snifferUuid != null) addPendingPortalRider(snifferUuid, player.getUuid());
+        POST_PORTAL_PLAYER_CLEANUP.put(player.getUuid(), 40);
+        scrubPortalMomentum(player);
+        clearPlayerRideState(player);
+
+        if (snifferUuid != null) {
+            net.minecraft.server.MinecraftServer server = null;
+            try { if (destination != null) server = destination.getServer(); } catch (Throwable ignored) {}
+            if (server == null) {
+                try { if (origin != null) server = origin.getServer(); } catch (Throwable ignored) {}
+            }
+            cleanupDimensionTransfer(snifferUuid, server);
+        }
+    }
+
+    public static void onEntityChangeWorld(Entity originalEntity, Entity newEntity, net.minecraft.server.world.ServerWorld origin, net.minecraft.server.world.ServerWorld destination) {
+        UUID snifferUuid = null;
+        SnifferEntity newSniffer = null;
+
+        try {
+            if (originalEntity instanceof SnifferEntity sniffer) {
+                snifferUuid = sniffer.getUuid();
+                recordPortalRiders(sniffer);
+            } else if (newEntity instanceof SnifferEntity sniffer) {
+                snifferUuid = sniffer.getUuid();
+            }
+            if (newEntity instanceof SnifferEntity sniffer) newSniffer = sniffer;
+        } catch (Throwable ignored) {}
+
+        if (snifferUuid == null) {
+            try {
+                if (originalEntity instanceof ArmorStandEntity) snifferUuid = getSnifferUuidForSeat(originalEntity);
+            } catch (Throwable ignored) {}
+            try {
+                if (snifferUuid == null && newEntity instanceof ArmorStandEntity) snifferUuid = getSnifferUuidForSeat(newEntity);
+            } catch (Throwable ignored) {}
+        }
+
+        if (snifferUuid == null) return;
+
+        net.minecraft.server.MinecraftServer server = null;
+        try { if (destination != null) server = destination.getServer(); } catch (Throwable ignored) {}
+        if (server == null) {
+            try { if (origin != null) server = origin.getServer(); } catch (Throwable ignored) {}
+        }
+        if (newSniffer != null) {
+            scrubPortalMomentum(newSniffer);
+            POST_PORTAL_SNIFFER_CLEANUP.put(newSniffer.getUuid(), 10);
+        }
+        if (PENDING_PORTAL_RIDERS.containsKey(snifferUuid) || isPortalDismountDelayed(snifferUuid)) {
+            schedulePortalDismount(snifferUuid);
+            return;
+        }
+        cleanupDimensionTransfer(snifferUuid, server);
+        if (newSniffer != null) {
+            finishPortalRiderTransfer(newSniffer, server);
+        }
+    }
+
+    private static void cleanupDimensionTransfer(UUID snifferUuid, net.minecraft.server.MinecraftServer server) {
+        if (snifferUuid == null) return;
+
+        try { RideableSnifferMod.logDebug("[PORTAL] Cleaning ride state for sniffer {}", snifferUuid); } catch (Throwable ignored) {}
+
+        java.util.Set<UUID> affectedPlayers = new java.util.HashSet<>();
+
+        try {
+            java.util.List<Entity> trackedSeats = SEAT_ENTITIES.remove(snifferUuid);
+            collectAndRemoveSeats(snifferUuid, trackedSeats, affectedPlayers);
+        } catch (Throwable ignored) {}
+
+        try {
+            if (server != null) {
+                for (var world : server.getWorlds()) {
+                    java.util.List<Entity> seatsInWorld = new java.util.ArrayList<>();
+                    for (Entity e : world.iterateEntities()) {
+                        try {
+                            if (e instanceof ArmorStandEntity && snifferUuid.equals(getSnifferUuidForSeat(e))) {
+                                seatsInWorld.add(e);
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    collectAndRemoveSeats(snifferUuid, seatsInWorld, affectedPlayers);
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            java.util.List<UUID> trackedPlayers = new java.util.ArrayList<>(RIDING_PLAYERS.keySet());
+            for (UUID playerUuid : trackedPlayers) {
+                try {
+                    RidingInfo info = RIDING_PLAYERS.get(playerUuid);
+                    if (info != null && snifferUuid.equals(info.snifferUuid)) {
+                        affectedPlayers.add(playerUuid);
+                        RIDING_PLAYERS.remove(playerUuid);
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
+
+        for (UUID playerUuid : affectedPlayers) {
+            try {
+                PlayerEntity player = server == null ? null : server.getPlayerManager().getPlayer(playerUuid);
+                if (player != null) clearPlayerRideState(player);
+                DISMOUNT_WATCH.remove(playerUuid);
+                RECENT_MOUNTS.remove(playerUuid);
+                PROMOTION_RETRIES.remove(playerUuid);
+            } catch (Throwable ignored) {}
+        }
+
+        try { RIDDEN_SNIFFERS.remove(snifferUuid); } catch (Throwable ignored) {}
+        try { PROMOTION_CHECK_TICKS.remove(snifferUuid); } catch (Throwable ignored) {}
+        try { PROMOTION_SCHEDULE.remove(snifferUuid); } catch (Throwable ignored) {}
+        try { SHIFT_SCHEDULE.remove(snifferUuid); } catch (Throwable ignored) {}
+        try { LAST_SNIFFER_POSITIONS.remove(snifferUuid); } catch (Throwable ignored) {}
+
+        try {
+            SnifferEntity sniffer = findSnifferByUuid(server, snifferUuid);
+            if (sniffer != null) {
+                scrubPortalMomentum(sniffer);
+                for (Entity passenger : new java.util.ArrayList<>(sniffer.getPassengerList())) {
+                    try { passenger.stopRiding(); } catch (Throwable ignored) {}
+                    if (passenger instanceof PlayerEntity player) clearPlayerRideState(player);
+                }
+                SnifferSpeedManager.restoreOriginalSpeed(sniffer);
+                if (hasSaddle(sniffer)) {
+                    try { applyEntitySaddleTracker(sniffer, true); } catch (Throwable ignored) {}
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void finishPortalRiderTransfer(SnifferEntity sniffer, net.minecraft.server.MinecraftServer server) {
+        if (sniffer == null || server == null) return;
+        java.util.Set<UUID> riders = PENDING_PORTAL_RIDERS.remove(sniffer.getUuid());
+        if (riders == null || riders.isEmpty()) return;
+
+        double tx = sniffer.getX();
+        double ty = sniffer.getY() + 1.0D;
+        double tz = sniffer.getZ();
+        World world = getReflectiveWorld(sniffer);
+
+        for (UUID playerUuid : riders) {
+            try {
+                net.minecraft.server.network.ServerPlayerEntity player = server.getPlayerManager().getPlayer(playerUuid);
+                if (player == null) continue;
+
+                clearPlayerRideState(player);
+                if (world instanceof net.minecraft.server.world.ServerWorld serverWorld && getReflectiveWorld(player) != serverWorld) {
+                    teleportPlayerAcrossWorld(player, serverWorld, tx, ty, tz);
+                } else {
+                    player.refreshPositionAndAngles(tx, ty, tz, player.getYaw(), player.getPitch());
+                    try { player.networkHandler.requestTeleport(tx, ty, tz, player.getYaw(), player.getPitch()); } catch (Throwable ignored) {}
+                }
+                clearPlayerRideState(player);
+                scrubPortalMomentum(player);
+                POST_PORTAL_PLAYER_CLEANUP.put(player.getUuid(), 20);
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void schedulePortalDismount(UUID snifferUuid) {
+        if (snifferUuid == null) return;
+        try { DELAYED_PORTAL_CLEANUP.putIfAbsent(snifferUuid, PORTAL_DISMOUNT_DELAY_TICKS); } catch (Throwable ignored) {}
+    }
+
+    private static boolean isPortalDismountDelayed(UUID snifferUuid) {
+        if (snifferUuid == null) return false;
+        try {
+            Integer ticks = DELAYED_PORTAL_CLEANUP.get(snifferUuid);
+            return ticks != null && ticks > 0;
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private static void processDelayedPortalCleanup(net.minecraft.server.MinecraftServer server) {
+        try {
+            java.util.List<UUID> keys = new java.util.ArrayList<>(DELAYED_PORTAL_CLEANUP.keySet());
+            for (UUID snifferUuid : keys) {
+                Integer ticks = DELAYED_PORTAL_CLEANUP.get(snifferUuid);
+                if (ticks == null) {
+                    DELAYED_PORTAL_CLEANUP.remove(snifferUuid);
+                    continue;
+                }
+
+                ticks = ticks - 1;
+                if (ticks > 0) {
+                    DELAYED_PORTAL_CLEANUP.put(snifferUuid, ticks);
+                    continue;
+                }
+
+                DELAYED_PORTAL_CLEANUP.remove(snifferUuid);
+                cleanupDimensionTransfer(snifferUuid, server);
+
+                SnifferEntity sniffer = findSnifferByUuid(server, snifferUuid);
+                if (sniffer != null) {
+                    scrubPortalMomentum(sniffer);
+                    finishPortalRiderTransfer(sniffer, server);
+                    POST_PORTAL_SNIFFER_CLEANUP.put(snifferUuid, 10);
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void processPostPortalCleanup(net.minecraft.server.MinecraftServer server) {
+        processDelayedPortalCleanup(server);
+
+        try {
+            java.util.List<UUID> playerKeys = new java.util.ArrayList<>(POST_PORTAL_PLAYER_CLEANUP.keySet());
+            for (UUID playerUuid : playerKeys) {
+                Integer ticks = POST_PORTAL_PLAYER_CLEANUP.get(playerUuid);
+                if (ticks == null || ticks <= 0) {
+                    POST_PORTAL_PLAYER_CLEANUP.remove(playerUuid);
+                    continue;
+                }
+
+                PlayerEntity player = server.getPlayerManager().getPlayer(playerUuid);
+                if (player != null) {
+                    UUID snifferUuid = getSnifferUuidForPlayer(player);
+                    if (isPortalDismountDelayed(snifferUuid)) {
+                        scrubPortalMomentum(player);
+                        POST_PORTAL_PLAYER_CLEANUP.put(playerUuid, ticks - 1);
+                        continue;
+                    }
+
+                    Entity vehicle = player.getVehicle();
+                    if (vehicle instanceof SnifferEntity || isSnifferSeatEntity(vehicle)) {
+                        clearPlayerRideState(player);
+                    }
+                    scrubPortalMomentum(player);
+                }
+                POST_PORTAL_PLAYER_CLEANUP.put(playerUuid, ticks - 1);
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            java.util.List<UUID> snifferKeys = new java.util.ArrayList<>(POST_PORTAL_SNIFFER_CLEANUP.keySet());
+            for (UUID snifferUuid : snifferKeys) {
+                Integer ticks = POST_PORTAL_SNIFFER_CLEANUP.get(snifferUuid);
+                if (ticks == null || ticks <= 0) {
+                    POST_PORTAL_SNIFFER_CLEANUP.remove(snifferUuid);
+                    PENDING_PORTAL_RIDERS.remove(snifferUuid);
+                    continue;
+                }
+
+                if (isPortalDismountDelayed(snifferUuid)) {
+                    SnifferEntity delayedSniffer = findSnifferByUuid(server, snifferUuid);
+                    if (delayedSniffer != null) scrubPortalMomentum(delayedSniffer);
+                    POST_PORTAL_SNIFFER_CLEANUP.put(snifferUuid, ticks - 1);
+                    continue;
+                }
+
+                SnifferEntity sniffer = findSnifferByUuid(server, snifferUuid);
+                if (sniffer != null) {
+                    scrubPortalMomentum(sniffer);
+                    if (getPassengerCount(sniffer) > 0) {
+                        cleanupDimensionTransfer(snifferUuid, server);
+                    }
+                    finishPortalRiderTransfer(sniffer, server);
+                    if (getPassengerCount(sniffer) == 0 && !PENDING_PORTAL_RIDERS.containsKey(snifferUuid)) {
+                        POST_PORTAL_SNIFFER_CLEANUP.remove(snifferUuid);
+                        continue;
+                    }
+                }
+                POST_PORTAL_SNIFFER_CLEANUP.put(snifferUuid, ticks - 1);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void recordPortalRiders(SnifferEntity sniffer) {
+        if (sniffer == null) return;
+        try {
+            for (PlayerEntity rider : getRiders(sniffer)) {
+                if (rider != null) addPendingPortalRider(sniffer.getUuid(), rider.getUuid());
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void recordSeatPortalRiders(UUID snifferUuid, Entity seat) {
+        if (snifferUuid == null || seat == null) return;
+        try {
+            for (Entity passenger : new java.util.ArrayList<>(seat.getPassengerList())) {
+                if (passenger instanceof PlayerEntity player) {
+                    addPendingPortalRider(snifferUuid, player.getUuid());
+                    POST_PORTAL_PLAYER_CLEANUP.put(player.getUuid(), 40);
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void addPendingPortalRider(UUID snifferUuid, UUID playerUuid) {
+        if (snifferUuid == null || playerUuid == null) return;
+        try {
+            PENDING_PORTAL_RIDERS.computeIfAbsent(snifferUuid, ignored -> ConcurrentHashMap.newKeySet()).add(playerUuid);
+        } catch (Throwable ignored) {}
+    }
+
+    private static UUID getSnifferUuidForPlayer(PlayerEntity player) {
+        if (player == null) return null;
+        try {
+            RidingInfo info = RIDING_PLAYERS.get(player.getUuid());
+            if (info != null) return info.snifferUuid;
+        } catch (Throwable ignored) {}
+
+        try {
+            Entity vehicle = player.getVehicle();
+            if (vehicle instanceof SnifferEntity sniffer) return sniffer.getUuid();
+            if (isSnifferSeatEntity(vehicle)) return getSnifferUuidForSeat(vehicle);
+        } catch (Throwable ignored) {}
+
+        return null;
+    }
+
+    private static boolean isSnifferSeatEntity(Entity entity) {
+        if (!(entity instanceof ArmorStandEntity)) return false;
+        try {
+            for (String tag : entity.getCommandTags()) {
+                if (tag != null && (tag.startsWith("SnifferParent:") || tag.startsWith("SnifferSeat:") || tag.startsWith("SnifferOccupant:"))) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private static void scrubPortalMomentum(Entity entity) {
+        if (entity == null) return;
+        try { resetFallDistance(entity); } catch (Throwable ignored) {}
+        try { entity.setVelocity(Vec3d.ZERO); } catch (Throwable ignored) {}
+        if (entity instanceof SnifferEntity sniffer) {
+            try { SnifferEventHandler.clearPortalMovementTracking(sniffer); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static net.minecraft.server.MinecraftServer getServerFromEntity(Entity entity) {
+        try {
+            World world = getReflectiveWorld(entity);
+            if (world instanceof net.minecraft.server.world.ServerWorld serverWorld) {
+                return serverWorld.getServer();
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static void teleportPlayerAcrossWorld(net.minecraft.server.network.ServerPlayerEntity player, net.minecraft.server.world.ServerWorld world, double x, double y, double z) {
+        try {
+            for (java.lang.reflect.Method method : player.getClass().getMethods()) {
+                Class<?>[] params = method.getParameterTypes();
+                if (params.length == 7
+                    && net.minecraft.server.world.ServerWorld.class.isAssignableFrom(params[0])
+                    && params[1] == double.class
+                    && params[2] == double.class
+                    && params[3] == double.class
+                    && java.util.Set.class.isAssignableFrom(params[4])
+                    && params[5] == float.class
+                    && params[6] == float.class) {
+                    method.setAccessible(true);
+                    method.invoke(player, world, x, y, z, java.util.Collections.emptySet(), player.getYaw(), player.getPitch());
+                    return;
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void collectAndRemoveSeats(UUID snifferUuid, java.util.List<Entity> seats, java.util.Set<UUID> affectedPlayers) {
+        if (snifferUuid == null || seats == null) return;
+
+        for (Entity seat : seats) {
+            if (seat == null) continue;
+            try {
+                for (Entity passenger : new java.util.ArrayList<>(seat.getPassengerList())) {
+                    if (passenger instanceof PlayerEntity player) {
+                        affectedPlayers.add(player.getUuid());
+                        clearPlayerRideState(player);
+                    } else {
+                        try { passenger.stopRiding(); } catch (Throwable ignored) {}
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            try { seat.getCommandTags().remove("SnifferParent:" + snifferUuid); } catch (Throwable ignored) {}
+            try { tryRemoveEntity(seat); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void clearPlayerRideState(PlayerEntity player) {
+        if (player == null) return;
+
+        try { RIDING_PLAYERS.remove(player.getUuid()); } catch (Throwable ignored) {}
+        try { DISMOUNT_WATCH.remove(player.getUuid()); } catch (Throwable ignored) {}
+        try { RECENT_MOUNTS.remove(player.getUuid()); } catch (Throwable ignored) {}
+
+        try {
+            Entity vehicle = player.getVehicle();
+            boolean snifferSeat = isSnifferSeatEntity(vehicle);
+            if (snifferSeat || vehicle instanceof SnifferEntity) {
+                player.stopRiding();
+            }
+        } catch (Throwable ignored) {}
+
+        try { resetFallDistance(player); } catch (Throwable ignored) {}
+        try { player.setVelocity(Vec3d.ZERO); } catch (Throwable ignored) {}
+    }
+
     public static void processDismountSafety(net.minecraft.server.MinecraftServer server) {
+        processPostPortalCleanup(server);
+
         if (!RIDING_PLAYERS.isEmpty()) {
             java.util.List<UUID> tracked = new java.util.ArrayList<>(RIDING_PLAYERS.keySet());
             for (UUID uuid : tracked) {

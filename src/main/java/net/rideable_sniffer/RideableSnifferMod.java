@@ -2,6 +2,7 @@ package net.rideable_sniffer;
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.entity.event.v1.ServerEntityWorldChangeEvents;
 import net.fabricmc.fabric.api.event.player.UseEntityCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -167,6 +168,12 @@ public class RideableSnifferMod implements ModInitializer {
 		});
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
 			try { SnifferPassengerManager.onPlayerDisconnect(handler.player, server); } catch (Throwable ignored) {}
+		});
+		ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((player, origin, destination) -> {
+			try { SnifferPassengerManager.onPlayerChangeWorld(player, origin, destination); } catch (Throwable ignored) {}
+		});
+		ServerEntityWorldChangeEvents.AFTER_ENTITY_CHANGE_WORLD.register((originalEntity, newEntity, origin, destination) -> {
+			try { SnifferPassengerManager.onEntityChangeWorld(originalEntity, newEntity, origin, destination); } catch (Throwable ignored) {}
 		});
 
 		ServerTickEvents.END_SERVER_TICK.register(server -> {

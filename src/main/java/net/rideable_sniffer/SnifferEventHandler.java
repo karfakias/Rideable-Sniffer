@@ -525,6 +525,13 @@ public class SnifferEventHandler {
         try { AIRBORNE_TICKS.remove(id); } catch (Throwable ignored) {}
     }
 
+    public static void clearPortalMovementTracking(SnifferEntity sniffer) {
+        if (sniffer == null) return;
+        UUID id = sniffer.getUuid();
+        clearAirborneTracking(id);
+        try { LAST_SNIFFER_Y.remove(id); } catch (Throwable ignored) {}
+    }
+
     private static void applyFallDamageToEntity(Entity ent, double fallDist) {
         if (!(ent instanceof LivingEntity living)) return;
 
